@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Admin - Rifa</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Panel Administrador</h1>
+    <p>Introduce la contraseña de administrador:</p>
+    <input type="password" id="adminPwd" placeholder="Contraseña admin" />
+    <button id="btnLoad">Cargar órdenes</button>
+
+    <div id="ordersArea" class="hidden">
+      <h2>Órdenes</h2>
+      <div id="orders"></div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      const pwd = document.getElementById('adminPwd').value;
+      if (!pwd) return alert('Introduce la contraseña');
+
+      const res = await fetch('/api/admin/orders', {
+        headers: { 'x-admin-password': pwd }
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(()=>({error:'Error'}));
+        return alert('Error: ' + (err.error || res.statusText));
+      }
+      const data = await res.json();
+      const ordersDiv = document.getElementById('orders');
+      ordersDiv.innerHTML = '';
+      data.orders.forEach(o => {
+        const relatedTickets = data.tickets.filter(t => t.order_id === o.id).map(t => t.number);
+        const div = document.createElement('div');
+        div.className = 'order';
+        div.innerHTML = `
+          <strong>Orden #${o.id}</strong> - ${o.buyer_name} (${o.email}) - ${o.quantity} boletos - Estado: ${o.status} - Referencia: ${o.reference} - Pago: ${o.payment_method} - TX: ${o.tx_id || '-'}
+          <br>Boletos: ${relatedTickets.join(', ')}
+          <br>
+          <button data-id="${o.id}" class="confirmBtn">Confirmar pago</button>
+        `;
+        ordersDiv.appendChild(div);
+      });
+
+      document.querySelectorAll('.confirmBtn').forEach(btn => {
+        btn.addEventListener('click', async (ev) => {
+          const id = ev.currentTarget.dataset.id;
+          if (!confirm('Confirmar orden #' + id + ' como pagada?')) return;
+          const r = await fetch('/api/admin/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-admin-password': pwd },
+            body: JSON.stringify({ order_id: Number(id) })
+          });
+          if (!r.ok) {
+            const e = await r.json().catch(()=>({error:'error'}));
+            alert('Error: ' + (e.error || r.statusText));
+          } else {
+            alert('Orden confirmada');
+            document.getElementById('btnLoad').click();
+          }
+        });
+      });
+
+      document.getElementById('ordersArea').classList.remove('hidden');
+    });
+  </script>
+</body>
+</html>

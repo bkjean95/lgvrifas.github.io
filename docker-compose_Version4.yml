@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - ADMIN_PASSWORD=tu_contraseña_admin
+      - PAGOMOVIL_NUMBER=0414XXXXXXXX
+      - BANK_ACCOUNT=Banco:Ejemplo,Cuenta:123456
+    volumes:
+      - .:/app
+      - ./rifas.db:/app/rifas.db

@@ -1,0 +1,12 @@
+# Puerto
+PORT=3000
+
+# Contraseña simple para el panel admin (cambia en producción)
+ADMIN_PASSWORD=tu_contraseña_admin
+
+# Datos de pago (modifica por los tuyos)
+PAGOMOVIL_NUMBER=0414XXXXXXXX
+BANK_ACCOUNT="BANCO: Ejemplo, CUENTA: 1234567890"
+
+# Archivo de BD SQLite (puedes cambiar)
+DB_FILE=rifas.db
