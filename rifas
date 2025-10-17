@@ -1,0 +1,441 @@
+//name=package.json
+{
+  "name": "rifas-secuencial",
+  "version": "1.0.0",
+  "description": "Rifas con asignación de boletos en secuencia y pagos por PagoMovil/transferencia",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.1",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  }
+}
+
+//name=server.js
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const Database = require('better-sqlite3');
+const path = require('path');
+require('dotenv').config();
+
+const PORT = process.env.PORT || 3000;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const PAGOMOVIL_NUMBER = process.env.PAGOMOVIL_NUMBER || '0414XXXXXXXX';
+const BANK_ACCOUNT = process.env.BANK_ACCOUNT || 'BANCO: Ejemplo, CUENTA: 1234567890, RIF: V-12345678';
+const DB_FILE = process.env.DB_FILE || 'rifas.db';
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+const db = new Database(DB_FILE);
+
+// Initialize schema
+db.prepare(`
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  buyer_name TEXT,
+  email TEXT,
+  quantity INTEGER,
+  status TEXT,
+  reference TEXT,
+  payment_method TEXT,
+  tx_id TEXT,
+  created_at TEXT
+);
+`).run();
+
+db.prepare(`
+CREATE TABLE IF NOT EXISTS tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  number INTEGER UNIQUE,
+  order_id INTEGER,
+  status TEXT,
+  FOREIGN KEY(order_id) REFERENCES orders(id)
+);
+`).run();
+
+function createReference() {
+  // simple unique reference (timestamp + random)
+  return 'REF-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,8).toUpperCase();
+}
+
+// Endpoint: buy tickets
+app.post('/api/buy', (req, res) => {
+  const { buyer_name, email, quantity, payment_method } = req.body;
+  if (!buyer_name || !email || !quantity || quantity <= 0) {
+    return res.status(400).json({ error: 'Faltan datos: buyer_name, email, quantity' });
+  }
+  if (!['pagomovil', 'transferencia'].includes((payment_method||'').toLowerCase())) {
+    return res.status(400).json({ error: 'payment_method debe ser "pagomovil" o "transferencia"' });
+  }
+
+  const reference = createReference();
+  const createdAt = new Date().toISOString();
+
+  const insertOrder = db.prepare(`INSERT INTO orders (buyer_name, email, quantity, status, reference, payment_method, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertTicket = db.prepare(`INSERT INTO tickets (number, order_id, status) VALUES (?, ?, ?)`);
+  const getMaxNum = db.prepare(`SELECT COALESCE(MAX(number), 0) as maxnum FROM tickets`);
+
+  const tx = db.transaction(() => {
+    const info = insertOrder.run(buyer_name, email, quantity, 'pending', reference, payment_method, createdAt);
+    const orderId = info.lastInsertRowid;
+    const maxnum = getMaxNum.get().maxnum;
+    const assigned = [];
+    for (let i = 1; i <= quantity; i++) {
+      const ticketNum = maxnum + i;
+      insertTicket.run(ticketNum, orderId, 'reserved');
+      assigned.push(ticketNum);
+    }
+    return { orderId, assigned };
+  });
+
+  try {
+    const { orderId, assigned } = tx();
+    const paymentInstructions = {
+      payment_method: payment_method,
+      pagomovil_number: PAGOMOVIL_NUMBER,
+      bank_account: BANK_ACCOUNT,
+      reference
+    };
+    return res.json({
+      ok: true,
+      order: {
+        id: orderId,
+        buyer_name,
+        email,
+        quantity,
+        status: 'pending',
+        reference,
+        tickets: assigned,
+        created_at: createdAt
+      },
+      paymentInstructions
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Error al crear la orden' });
+  }
+});
+
+// Endpoint: user confirms payment (submit tx id / comprobante text)
+app.post('/api/confirm', (req, res) => {
+  const { order_id, tx_id } = req.body;
+  if (!order_id || !tx_id) return res.status(400).json({ error: 'order_id y tx_id son requeridos' });
+
+  const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order_id);
+  if (!order) return res.status(404).json({ error: 'Orden no encontrada' });
+
+  db.prepare(`UPDATE orders SET tx_id = ?, status = ? WHERE id = ?`).run(tx_id, 'awaiting_confirmation', order_id);
+  return res.json({ ok: true, message: 'Comprobante registrado. El administrador verificará y confirmará la orden.' });
+});
+
+// Admin: list orders (simple header auth)
+app.get('/api/admin/orders', (req, res) => {
+  const pwd = req.header('x-admin-password');
+  if (pwd !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+  const orders = db.prepare(`SELECT * FROM orders ORDER BY created_at DESC`).all();
+  const tickets = db.prepare(`SELECT * FROM tickets`).all();
+  return res.json({ orders, tickets });
+});
+
+// Admin: confirm order -> mark order status 'paid' and tickets 'sold'
+app.post('/api/admin/confirm', (req, res) => {
+  const pwd = req.header('x-admin-password');
+  if (pwd !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { order_id } = req.body;
+  if (!order_id) return res.status(400).json({ error: 'order_id requerido' });
+
+  const order = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order_id);
+  if (!order) return res.status(404).json({ error: 'Orden no encontrada' });
+
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE orders SET status = ? WHERE id = ?`).run('paid', order_id);
+    db.prepare(`UPDATE tickets SET status = ?, order_id = ? WHERE order_id = ?`).run('sold', order_id, order_id);
+  });
+
+  try {
+    tx();
+    return res.json({ ok: true, message: 'Orden confirmada y boletos marcados como vendidos' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Error al confirmar' });
+  }
+});
+
+// Serve admin page
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Servidor iniciado en http://localhost:${PORT}`);
+});
+
+
+name=public/index.html
+
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Rifas - Comprar Boletos</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Rifa - Comprar Boletos</h1>
+
+    <form id="buyForm">
+      <label>Nombre:
+        <input type="text" name="buyer_name" required />
+      </label>
+      <label>Email:
+        <input type="email" name="email" required />
+      </label>
+      <label>Cantidad de boletos:
+        <input type="number" name="quantity" min="1" max="100" value="1" required />
+      </label>
+      <label>Método de pago:
+        <select name="payment_method">
+          <option value="pagomovil">PagoMovil</option>
+          <option value="transferencia">Transferencia</option>
+        </select>
+      </label>
+      <button type="submit">Reservar boletos y ver instrucciones de pago</button>
+    </form>
+
+    <div id="result" class="hidden"></div>
+
+    <hr />
+
+    <h2>Ya pagué</h2>
+    <p>Si ya realizaste el pago, registra aquí tu número de transacción (tx id) o referencia del comprobante para que el administrador lo verifique.</p>
+    <form id="confirmForm">
+      <label>Order ID:
+        <input type="number" name="order_id" required />
+      </label>
+      <label>Número de transacción / referencia:
+        <input type="text" name="tx_id" required />
+      </label>
+      <button type="submit">Enviar comprobante</button>
+    </form>
+    <div id="confirmResult" class="hidden"></div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
+
+
+name=public/admin.html
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Admin - Rifa</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Panel Administrador</h1>
+    <p>Introduce la contraseña de administrador:</p>
+    <input type="password" id="adminPwd" placeholder="Contraseña admin" />
+    <button id="btnLoad">Cargar órdenes</button>
+
+    <div id="ordersArea" class="hidden">
+      <h2>Órdenes</h2>
+      <div id="orders"></div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      const pwd = document.getElementById('adminPwd').value;
+      if (!pwd) return alert('Introduce la contraseña');
+
+      const res = await fetch('/api/admin/orders', {
+        headers: { 'x-admin-password': pwd }
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(()=>({error:'Error'}));
+        return alert('Error: ' + (err.error || res.statusText));
+      }
+      const data = await res.json();
+      const ordersDiv = document.getElementById('orders');
+      ordersDiv.innerHTML = '';
+      data.orders.forEach(o => {
+        const relatedTickets = data.tickets.filter(t => t.order_id === o.id).map(t => t.number);
+        const div = document.createElement('div');
+        div.className = 'order';
+        div.innerHTML = `
+          <strong>Orden #${o.id}</strong> - ${o.buyer_name} (${o.email}) - ${o.quantity} boletos - Estado: ${o.status} - Referencia: ${o.reference} - Pago: ${o.payment_method} - TX: ${o.tx_id || '-'}
+          <br>Boletos: ${relatedTickets.join(', ')}
+          <br>
+          <button data-id="${o.id}" class="confirmBtn">Confirmar pago</button>
+        `;
+        ordersDiv.appendChild(div);
+      });
+
+      document.querySelectorAll('.confirmBtn').forEach(btn => {
+        btn.addEventListener('click', async (ev) => {
+          const id = ev.currentTarget.dataset.id;
+          if (!confirm('Confirmar orden #' + id + ' como pagada?')) return;
+          const r = await fetch('/api/admin/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-admin-password': pwd },
+            body: JSON.stringify({ order_id: Number(id) })
+          });
+          if (!r.ok) {
+            const e = await r.json().catch(()=>({error:'error'}));
+            alert('Error: ' + (e.error || r.statusText));
+          } else {
+            alert('Orden confirmada');
+            // reload
+            document.getElementById('btnLoad').click();
+          }
+        });
+      });
+
+      document.getElementById('ordersArea').classList.remove('hidden');
+    });
+  </script>
+</body>
+</html>
+
+
+name=public/app.js
+
+document.getElementById('buyForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.currentTarget);
+  const body = {
+    buyer_name: fd.get('buyer_name'),
+    email: fd.get('email'),
+    quantity: Number(fd.get('quantity')),
+    payment_method: fd.get('payment_method')
+  };
+  const res = await fetch('/api/buy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const json = await res.json();
+  const result = document.getElementById('result');
+  result.classList.remove('hidden');
+  if (!res.ok) {
+    result.innerText = 'Error: ' + (json.error || JSON.stringify(json));
+    return;
+  }
+  result.innerHTML = `
+    <h3>Reserva creada</h3>
+    <p>Orden ID: <strong>${json.order.id}</strong></p>
+    <p>Boletos asignados: <strong>${json.order.tickets.join(', ')}</strong></p>
+    <h4>Instrucciones de pago</h4>
+    <p>Método: ${json.paymentInstructions.payment_method}</p>
+    <p>PagoMovil: ${json.paymentInstructions.pagomovil_number}</p>
+    <p>Transferencia: ${json.paymentInstructions.bank_account}</p>
+    <p>Referencia a incluir en la transferencia / nota: <strong>${json.paymentInstructions.reference}</strong></p>
+    <p>Después de pagar, vuelve y registra tu número de transacción en la sección "Ya pagué".</p>
+  `;
+});
+
+document.getElementById('confirmForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.currentTarget);
+  const body = {
+    order_id: Number(fd.get('order_id')),
+    tx_id: fd.get('tx_id')
+  };
+  const res = await fetch('/api/confirm', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const json = await res.json();
+  const out = document.getElementById('confirmResult');
+  out.classList.remove('hidden');
+  if (!res.ok) {
+    out.innerText = 'Error: ' + (json.error || JSON.stringify(json));
+  } else {
+    out.innerText = json.message || 'Comprobante enviado';
+  }
+});
+
+// name=public/style.css
+
+body {
+  font-family: Arial, sans-serif;
+  padding: 20px;
+  background: #f4f6f8;
+}
+.container {
+  max-width: 700px;
+  margin: 0 auto;
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+}
+label { display:block; margin:10px 0; }
+input, select { width:100%; padding:8px; box-sizing:border-box; margin-top:4px; }
+button { padding:10px 16px; margin-top:8px; }
+.hidden { display:none; }
+.order { padding:10px; border-bottom:1px solid #eee; margin-bottom:8px; }
+
+
+
+//# Rifa secuencial - Ejemplo
+
+Este proyecto es un ejemplo mínimo de una página para vender boletos de rifa donde:
+- Los boletos se asignan en secuencia (1, 2, 3, ...).
+- El comprador recibe instrucciones para pagar por PagoMovil o transferencia.
+- El comprador registra el número de transacción (tx id) como comprobante.
+- Un administrador confirma manualmente los pagos y marca los boletos como vendidos.
+
+Requisitos
+- Node.js 16+ recomendado
+- npm
+
+Instalación
+1. Clona o copia los archivos.
+2. Instala dependencias:
+   npm install
+
+3. Variables de entorno (opcional). Puedes crear un archivo `.env` en la raíz con:
+   PORT=3000
+   ADMIN_PASSWORD=tu_contraseña_admin
+   PAGOMOVIL_NUMBER=0414XXXXXXXX
+   BANK_ACCOUNT="BANCO: Ejemplo, CUENTA: 1234567890"
+   DB_FILE=rifas.db
+
+Uso
+npm start
+
+Visita:
+- Página pública: http://localhost:3000/
+- Panel administrador: http://localhost:3000/admin
+
+Flujo de compra
+1. El usuario completa nombre, email y cantidad de boletos.
+2. Se crea una orden y se asignan los siguientes números de boletos disponibles (reserved).
+3. Se muestra una referencia de pago y datos (PagoMovil / transferencia).
+4. El usuario realiza el pago y registra su tx id en la sección "Ya pagué".
+5. El administrador, desde /admin (con la contraseña), revisa las órdenes y confirma los pagos. Al confirmar, la orden pasa a `paid` y los boletos a `sold`.
+
+Notas y mejoras posibles
+- Añadir subida de comprobantes (archivos) con almacenamiento seguro.
+- Integrar pasarela de pagos (si se desea pago automático).
+- Enviar correos de notificación (orden creada / pago confirmado).
+- Añadir límites por usuario, bloqueo de IP, tasa de compra, y protección contra bots.
+- Añadir pruebas automáticas y validaciones más estrictas.
